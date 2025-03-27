@@ -1,0 +1,329 @@
+name: 'Gaunssian_Rendering'
+
+ddp:
+    master_addr: "localhost"
+    master_port: "29501"
+    num_devices: 8
+    device_id: 0
+    train_gpu: "0"
+    
+rlbench:
+    task_name: "multi"
+    # change the task as you want. in our paper, we select these 10 tasks.
+    tasks: [close_jar,open_drawer,sweep_to_dustpan_of_size,meat_off_grill,turn_tap,slide_block_to_color_target,put_item_in_drawer,reach_and_drag,push_buttons,stack_blocks]
+    # you could try more/fewer demos.
+    demos: 20
+      # you could try more/fewer views.
+    num_view: 21
+    demo_path: /my/demo/path    # will be removed by "${cur_dir}/data/train_data" in cli
+    episode_length: 15
+    # full cameras: [front,left_shoulder,right_shoulder,wrist]
+    # we find that one camera is very enough to achieve decent performance.
+    cameras: [front]
+    camera_resolution: [128, 128]
+    scene_bounds: [-0.3, -0.5, 0.6, 0.7, 0.5, 1.6]
+    include_lang_goal_in_obs: True
+    headless: True
+
+train:
+    sample_trajectory_nums: 1    # use only one compelete demonstration trajectroy for gaussian_rendering train, for in real world, demonstration data is always sparse
+    batch_size: 1                # demostration data is sampled from vedio, so in a same batch we could get a serial of data actions of tiny virations
+    image_choose: [2, 7, 12, 16, 20]
+    seg_save: /my/demo/seg_save  # will be removed by "${cur_dir}/data/seg_data" in cli
+    lamada_image_loss: 0.1
+    lamada_mask_loss: 0.4
+    lamada_ssim_loss: 0.15
+    lamada_skeleton_loss: 0.005
+    epochs: 5
+    lr: 0.00005
+    inner_loop_epochs: 1
+
+skeleton_recon:
+    # unet_embed
+    base_dim: 128
+    num_blocks: 4
+    attention_resolutions: [16]
+    unet_embed_dim: 64
+    # depth_predictor
+    depth_pred_inchannels: 64
+    depth_pred_midchannels: 16
+    # keypoint sample
+    each_mask_sample_num: 18
+    non_masks_sample_num: 24
+    non_masks_disturb_epsilon: 2
+    # nn init scale/bias
+    depth_scale: 1.0
+    depth_bias:  0.0
+    xyz_scale:   0.02
+    xyz_bias:    0.003
+    cov_scale:   1.0
+    cov_bias:    0.0
+    pi_scale:    1.0
+    pi_bias:     0.0
+    # recon sample points num
+    recon_sample_num: 1000
+
+gaussian_renderer:
+    # voxelizer
+    voxel_sizes: 100
+    voxel_shape: 100
+    final_dim: 128
+    # encoder
+    _3d_latent: 128
+    _2d_latent: 64
+    d_lang: 128
+    n_blocks: 5
+    d_hidden: 512
+    combine_layer: 3
+    combine_type: average
+    beta: 0.0
+    use_spade: False
+    # decoder
+    opacity_scale: 1.0
+    opacity_bias: -2.0
+    scale_bias: 0.02
+    scale_scale: 0.003
+    xyz_scale: 0.1
+    xyz_bias: 0.0
+    max_sh_degree: 1
+
+code:
+  num_freqs: 6
+  freq_factor: 1.5
+  include_input: True
+
+cam:
+    focal: -110.851248
+    znear: 0.9
+    zfar: 2.7
+
+# dataset
+dataset:
+    trans: [0.0, 0.0, 0.0]
+    scale: 1.0
+    bg_color: [0, 0, 0]
+    
+# sam2
+sam2:
+    points_per_side:  18
+    points_per_batch: 9
+    pred_iou_thresh:  0.45
+    stability_score_thresh: 0.45
+    stability_score_offset: 0.45
+    crop_n_layers: 0
+    box_nms_thresh: 0.6
+    crop_n_points_downscale_factor: 1
+    min_mask_region_area: 20
+    use_m2m: False
+    mask_threshold: 0.0
+    max_hole_area:  0.1
+    max_sprinkle_area: 0.1
+
+    
+evaluation: # for online evaluation
+    eval_freq: 10000
+    eval_episodes: 25
+    time_in_state: True
+    record_every_n: 10000
+    episode_length: 15  # default
+    # episode_length: 25
+    gpu: 0
+
+
+framework:
+    run_seed_process_num: 1
+    use_online_evaluation: False
+    log_freq: 100
+    save_freq: 10000
+    train_envs: 1
+    replay_ratio: ${replay.batch_size}
+    transitions_before_train: 200
+    tensorboard_logging: False
+    csv_logging: True
+    training_iterations: 100010
+    gpu: 0
+    env_gpu: 0
+    logdir: 'logs/'
+    logging_level: 20 # https://docs.python.org/3/library/logging.html#levels
+    seeds: 1
+    start_seed: 0
+    load_existing_weights: False
+    num_weights_to_keep: 60 # older checkpoints will be deleted chronologically
+    num_workers: 0
+    record_every_n: 5
+    # wandb setting
+    use_wandb: True
+    wandb_project: "manigaussian"
+    wandb_group: ${rlbench.task_name}_${method.name}
+    seed: 0
+    wandb_name: ${framework.seed}
+    tqdm_mininterval: 10    # tqdm print interval (s)
+
+
+defaults:
+    - method: ManiGaussian_BC
+
+hydra:
+    run:
+        dir: ${framework.logdir}/${rlbench.task_name}
+
+
+use_fabric: False
+
+use_depth: True
+use_neural_rendering: True
+num_view_for_nerf: 20
+
+# choices: T5 (768), CLIP (512)
+# we use CLIP as language model. Users could explore more about other language models such as T5.
+language_model: 'CLIP'
+language_model_dim: 512
+
+# Voxelization
+image_crop_size: 64
+bounds_offset: [0.15]
+voxel_sizes: [100]
+include_prev_layer: False
+
+# Perceiver
+num_latents: 2048
+latent_dim: 512
+transformer_depth: 6  # default: 6
+transformer_iterations: 1
+cross_heads: 1
+cross_dim_head: 64
+latent_heads: 8
+latent_dim_head: 64
+pos_encoding_with_lang: True
+conv_downsample: True
+lang_fusion_type: 'seq' # or 'concat'
+voxel_patch_size: 5
+voxel_patch_stride: 5
+final_dim: 128
+
+# Training
+input_dropout: 0.1
+attn_dropout: 0.1
+decoder_dropout: 0.0
+
+lr: 0.0005  # GNFactor
+lr_scheduler: False
+num_warmup_steps: 3000
+optimizer: 'lamb' # or 'adam'
+lambda_weight_l2: 0.000001  # weight_decay
+
+# BC loss coeffs
+trans_loss_weight: 1.0
+rot_loss_weight: 1.0
+grip_loss_weight: 1.0
+collision_loss_weight: 1.0
+rotation_resolution: 5
+
+# Network
+activation: lrelu
+norm: None
+
+# Augmentation
+crop_augmentation: True
+transform_augmentation:
+  apply_se3: True
+  aug_xyz: [0.125, 0.125, 0.125]
+  aug_rpy: [0.0, 0.0, 45.0]
+  aug_rot_resolution: ${method.rotation_resolution}
+
+demo_augmentation: True
+demo_augmentation_every_n: 10
+
+# Ablations
+no_skip_connection: False
+no_perceiver: False
+no_language: False
+keypoint_method: 'heuristic'
+
+# wandb logger
+use_wandb: True # covered in bash file
+
+lambda_bc: 1.0
+
+# Auxiliary Loss
+neural_renderer:
+  # Gaussian Splatting (GS)
+  visdom: False
+  render_freq: 1000
+
+  use_clip: False
+
+  use_dynamic_field: False  # please set use_neural_rendering true first
+
+  # weight for all auxiliary losses
+  lambda_nerf: 0.01
+
+  # ManiGaussian loss weight. 
+  lambda_embed: 0.01 # Semantic Feature Consistency Loss.
+  lambda_rgb: 1.0 # Current Scene Consistency Loss.
+  lambda_l1: 1.0 # L1 loss for Gaussian Splatting
+  lambda_ssim: 0.0 # SSIM loss for Gaussian Splatting
+
+  lambda_dyna: 0.01
+  lambda_reg: 0.0 # not used
+
+  dataset:
+    use_processed_data: True
+    bg_color: [0, 0, 0]
+    # bg_color: [0, 0.196, 0.220] # teal (deep green) color for RLBench background
+    zfar: 4.0
+    znear: 0.1
+    trans: [0.0, 0.0, 0.0]
+    scale: 1.0
+    mask_gt_rgb: False
+
+  foundation_model_name: null # or 'diffusion' or 'dinov2'
+  d_embed: 3
+  loss_embed_fn: cosine
+  
+  d_latent: 128
+  
+  d_lang: 128
+  
+  voxel_shape: 100
+  image_width: 128
+  image_height: 128
+  coordinate_bounds: [-0.3, -0.5, 0.6, 0.7, 0.5, 1.6]
+
+  use_code: True
+  use_code_viewdirs: False
+  use_xyz: True
+
+  mlp:
+    n_blocks: 5
+    d_hidden: 512
+    combine_layer: 3
+    combine_type: average
+    beta: 0.0
+    use_spade: False
+
+    opacity_scale: 1.0
+    opacity_bias: -2.0
+    scale_bias: 0.02
+    scale_scale: 0.003
+    xyz_scale: 0.1
+    xyz_bias: 0.0
+    max_sh_degree: 1
+
+  next_mlp:
+    d_in: 3
+    d_lang: 128
+    d_out: 3
+    n_blocks: 5
+    d_hidden: 512
+    combine_layer: 3
+    combine_type: average
+    beta: 0.0
+    use_spade: False
+    warm_up: 3000
+    use_action: True
+
+  code:
+    num_freqs: 6
+    freq_factor: 1.5
+    include_input: True

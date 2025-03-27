@@ -1,0 +1,3 @@
+from agents.dyna_q_agent.manigaussian_dyna_q.dyna_Q_manigaussian_agent_source import operate
+
+operate()
