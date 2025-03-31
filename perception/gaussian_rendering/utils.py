@@ -83,7 +83,6 @@ def save_multiview_image(images:torch.Tensor, tag=None):
         single_batch_image = images[i].squeeze(0)
         for j in range(N):
             image = single_batch_image[j].squeeze(0).clone()
-
             image = image.cpu().numpy() * 255
             image = np.asarray(image).astype(np.uint8)
             pil_image = Image.fromarray(image)

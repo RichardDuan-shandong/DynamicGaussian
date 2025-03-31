@@ -11,7 +11,7 @@ from termcolor import colored, cprint
 
 from perception.gaussian_rendering.resnetfc import ResnetFC
 from perception.gaussian_rendering.utils  import PositionalEncoding, visualize_pcd
-
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from typing import List
 import numpy as np
@@ -30,9 +30,18 @@ class GuassianDecoder(nn.Module):
             in_features=sum(out_channels),
             out_features=sum(out_channels),
         )
+        start_channels = 0
+        for out_channel, b, s in zip(out_channels, bias, scale):
+            nn.init.xavier_uniform_(self.out.weight[start_channels:start_channels+out_channel, :], s)
+            nn.init.constant_(
+                self.out.bias[start_channels:start_channels+out_channel], b)
+            start_channels += out_channel
+            
     def forward(self, x):
         return self.out(self.activation(x, beta=100))
     
+
+
 class GaussianEncoder(nn.Module):
     def __init__(self, cfg, out_channels):
         super().__init__()
@@ -148,17 +157,17 @@ class GaussianEncoder(nn.Module):
         B, N, _ = pcds.shape
         
         pcds = pcds.clone().detach()
-        canon_xyz = self.world_to_canonical(pcds)   # [1,N,3], min:-2.28, max:1.39
-
+        # canon_xyz = self.world_to_canonical(pcds)   # [1,N,3], min:-2.28, max:1.39
         # positional encoding
-        position_xyz = canon_xyz.reshape(-1, 3)  # (SB*B, 3)
+        position_xyz = pcds.reshape(-1, 3)  # (SB*B, 3)
         position_code = self.code(position_xyz)    # [N, 39]
         
         # volumetric sampling
-        points_3d_feature = self.sample_in_canonical_voxel(canon_xyz, voxel_feature) # [B, N, 128]
+        points_3d_feature = self.sample_in_canonical_voxel(pcds, voxel_feature) # [B, N, 128]
         points_3d_feature = points_3d_feature.reshape(-1, self.d_latent[0])  # [N, 128]
 
         # planar sampling
+
         points_2d_feature = self.sample_in_feature_map(pcds_project_to_image, image_feature)    # [B, N, 64]
         points_2d_feature = points_2d_feature.reshape(-1, self.d_latent[1])  # [N, 64]
         
@@ -184,31 +193,26 @@ class GaussianEncoder(nn.Module):
         
         latent = latent.reshape(-1, N, self.d_out)  # [1, N, d_out]
 
-        return latent, canon_xyz
+        return latent
     
 class GaussianRegressor(nn.Module):
-    def __init__(self, cfg, device_ids):
+    def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-
-
         split_dimensions, scale_inits, bias_inits = self._get_splits_and_inits(cfg)
-
-
         self.d_out = sum(split_dimensions)
         
-
-        self.gs_encoder = torch.nn.DataParallel(GaussianEncoder(
+        self.gs_encoder = GaussianEncoder(
             cfg,
             split_dimensions,
-        ), device_ids=device_ids)
-        self.gs_decoder = torch.nn.DataParallel(GuassianDecoder(
+        )
+        
+        self.gs_decoder = GuassianDecoder(
             cfg,
             split_dimensions,
             scale=scale_inits,
             bias=bias_inits,
-        ), device_ids=device_ids)
-    
+        )
         
         self.scaling_activation = torch.exp
         # self.scaling_activation = torch.nn.functional.softplus
@@ -230,16 +234,16 @@ class GaussianRegressor(nn.Module):
             cfg.gaussian_renderer.opacity_scale,
             cfg.gaussian_renderer.scale_scale,
             1.0,    # rotation
-            5.0,    # feature_dc
-            1.0,    # feature
+            1.0,    # feature_dc
+            0.5,    # feature
             ]
         bias_inits = [
             cfg.gaussian_renderer.xyz_bias, 
             cfg.gaussian_renderer.opacity_bias,
             np.log(cfg.gaussian_renderer.scale_bias),
             0.0,
-            0.0,
-            0.0,
+            0.1,
+            0.05,
             ]
         if cfg.gaussian_renderer.max_sh_degree != 0:    # default: 1
             sh_num = (self.cfg.gaussian_renderer.max_sh_degree + 1) ** 2 - 1    # 3
@@ -263,9 +267,9 @@ class GaussianRegressor(nn.Module):
         Predict gaussian parameter maps
         [Note] Typically B=1
         """
-           
+
         # encode pcds
-        latent, canon_xyz = self.gs_encoder(pcds, pcds_project_to_image, voxel_feature, image_feature)
+        latent = self.gs_encoder(pcds, pcds_project_to_image, voxel_feature, image_feature)
         
         # decode gaussian params
         split_network_outputs = self.gs_decoder(latent) # [1, N, (3, 1, 3, 4, 3, 9)]
@@ -285,13 +289,11 @@ class GaussianRegressor(nn.Module):
         scale_maps = self.scaling_activation(scale_maps)    # exp
         scale_maps = torch.clamp_max(scale_maps, 0.05)
         
-        pcds = pcds.to(device=xyz_maps.device)
+        # pcds = pcds.to(device=xyz_maps.device)
         
         # zero_tensor = torch.zeros_like(latent)
         # import torch.nn.functional as F
         # test_loss = F.l1_loss(latent, zero_tensor)
-
-        
         gaussian_params = {}
         gaussian_params['xyz_maps'] = pcds + xyz_maps   # [B, N, 3]
         gaussian_params['sh_maps'] = sh_out    # [B, N, 4, 3]

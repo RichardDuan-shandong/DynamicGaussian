@@ -18,17 +18,19 @@ import torch.nn.functional as F
 from torchvision import transforms
 import os
 from termcolor import cprint
-import lightning as L
 import PIL.Image as Image
 from perception.mask_generator._2d_seg_generator import _2d_seg_generator
 from pathlib import Path
 from tqdm import tqdm
-from perception.gaussian_recon import SkeletonSplatter, GaussianSampler, GaussianRenderer, get_image_projected_points
+from perception.gaussian_recon import SkeletonSplatter, GaussianSampler, GaussianRenderer, GaussianRegress, get_image_projected_points
 from perception.gaussian_rendering.utils import save_multiview_image, get_merged_masks
 from perception.loss import l1_loss, l1_loss_mask, gmm_loss
 import pytorch_msssim
 from termcolor import cprint
 import copy
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+
 
 def save_checkpoint(model, optimizer, epoch, filepath):
     checkpoint = {
@@ -90,6 +92,7 @@ def _preprocess_data(seg_generator, data_save_path, batch_data, cfg):
         
         task = single_step_multiview['description'][0]
         images_multiview = single_step_multiview['image']
+        depths_multiview = single_step_multiview['depth']
         poses_multiview = single_step_multiview['pose']
         
         import torchvision.transforms.functional as F
@@ -150,6 +153,7 @@ def _preprocess_data(seg_generator, data_save_path, batch_data, cfg):
             data_['gt_view'] = []
             
             data_['input_view']['image'] = single_step_multiview['image'][cfg.train.image_choose[i]]
+            data_['input_view']['depth'] = single_step_multiview['depth'][cfg.train.image_choose[i]]    # only input view needs depth image
             data_['input_view']['pose'] = [single_step_multiview['pose'][0][cfg.train.image_choose[i]], single_step_multiview['pose'][1][cfg.train.image_choose[i]], single_step_multiview['pose'][2][cfg.train.image_choose[i]]]
             data_['input_view']['masks'] = multi_view_sub_part_masks[i]
             
@@ -183,28 +187,57 @@ def check_tensor_status(tensor, name):
         print(f"{name} requires gradient.")
     else:
         print(f"{name} does NOT require gradient.")
-        
+
+def save_pcd(pcds, means_3d, cov_3d, weight_3d, object_index):
+    with open("point_cloud.pkl", "wb") as f:
+        pickle.dump(pcds[1].cpu(), f)  # .cpu() 确保数据存储在 CPU
+    with open("point_cloud_means.pkl", "wb") as f:
+        pickle.dump(means_3d[1].cpu(), f)  # .cpu() 确保数据存储在 CPU
+    with open("point_cloud_cov.pkl", "wb") as f:
+        pickle.dump(cov_3d[1].cpu(), f)  # .cpu() 确保数据存储在 CPU
+    with open("point_cloud_weight.pkl", "wb") as f:
+        pickle.dump(weight_3d[1].cpu(), f)  # .cpu() 确保数据存储在 CPU
+    with open("point_cloud_object.pkl", "wb") as f:
+        pickle.dump(object_index[1].cpu(), f)  # .cpu() 确保数据存储在 CPU
+    with open("point_cloud_before_0.pkl", "wb") as f:
+        pickle.dump(pcds[0].cpu(), f)
+       # print(data[0]['input_view']['pose'][0])
+    with open("point_cloud_before_1.pkl", "wb") as f:
+        pickle.dump(pcds[1].cpu(), f)
+        #print(data[1]['input_view']['pose'][0])
+    with open("point_cloud_before_2.pkl", "wb") as f:
+       pickle.dump(pcds[2].cpu(), f)
+       # print(data[2]['input_view']['pose'][0])
+    with open("point_cloud_before_3.pkl", "wb") as f:
+        pickle.dump(pcds[3].cpu(), f)
+    with open("point_cloud_after_2.pkl", "wb") as f:
+       pickle.dump(new_pcds[2].cpu(), f)
+ 
+
 def train(
         origin_data,
         cfg,
-        device_list
+        rank
     ):
-    
     tasks = cfg.rlbench.tasks
     seg_generator = None
     data = None
+
+        
     torch.cuda.empty_cache()
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
     
-    gaussian_splatter = SkeletonSplatter(cfg, device_list)
+    gaussian_splatter = DDP(SkeletonSplatter(cfg).to(device=device), device_ids=[rank], output_device=rank)
     gaussian_sampler = GaussianSampler(cfg)
-    gaussian_regressor = GaussianRenderer(cfg, device_list)
+    gaussian_regressor = DDP(GaussianRegress(cfg).to(device=device), device_ids=[rank], output_device=rank)
+    gaussian_render = GaussianRenderer(cfg)
     
-    gaussian_splatter = gaussian_splatter.to(device="cuda:0")
-    gaussian_regressor = gaussian_regressor.to(device="cuda:0")
+    optimizer = torch.optim.Adam(list(gaussian_splatter.parameters()) + list(gaussian_regressor.parameters()), lr=cfg.train.lr)
     
     optimizer_gaussian_splatter = torch.optim.Adam(gaussian_splatter.parameters(), lr=cfg.train.lr)
     optimizer_gaussian_regressor = torch.optim.Adam(gaussian_regressor.parameters(), lr=cfg.train.lr)
-    
+
     start_epoch = 0
     step = 0
     
@@ -250,59 +283,60 @@ def train(
                     image_groundtruth_mask.append(single_batch_data_gt_mask)
                 image_groundtruth = torch.stack(image_groundtruth, dim=0)  # (B, N, 128, 128, 3)
                 image_groundtruth_mask = torch.cat(image_groundtruth_mask, dim=0) # (B, N, 128, 128)
-                for t in range(10):
+                for t in range(cfg.train.inner_loop_epochs):
                     # get 3d gaussian skeleton through a depth_predictor
-                    means_3d, cov_3d, weight_3d, object_index, feature_map = gaussian_splatter(data)
+                    means_3d, cov_3d, weight_3d, object_index, feature_map, image_color = gaussian_splatter(data)
                     # sample the 3d gaussian skeleton to get pcds
                     pcds, skeleton_gmm = gaussian_sampler.sample(data=data, means_3d=means_3d, cov_3d=cov_3d, weight_3d=weight_3d, object_index=object_index)
-                    pcds_project_to_image = get_image_projected_points(data=data, pcds=pcds, cfg=cfg)
+                    # project the sampled 3d points to 2d cam_view plane
+                    pcds_project_to_image = get_image_projected_points(data=data, pcds=pcds, cfg=cfg)   
                     # ==2. get reconstructed data(with single view input and multiview output)==
-                    for inner_loop in range(cfg.train.inner_loop_epochs):
-                        # decode the pcds to get a gaussian splatting pcds, and render the predicted_image
-                        image_predict, new_pcds, gaussian_params_list = gaussian_regressor(data, pcds, pcds_project_to_image, feature_map) 
-                        print(pcds)
-                        # calculate rendering_loss
-                        image_groundtruth = image_groundtruth.to(device=image_predict.device)
-                        image_groundtruth_mask = image_groundtruth_mask.to(device=image_predict.device)
-                        image_loss = l1_loss(image_predict, image_groundtruth)
-                        mask_loss = l1_loss_mask(image_predict, image_groundtruth, image_groundtruth_mask)
-                        ssim_loss = pytorch_msssim.ssim(image_predict, image_groundtruth, data_range=1)
-                        lamada_image_loss = cfg.train.lamada_image_loss
-                        lamada_mask_loss = cfg.train.lamada_mask_loss
-                        lamada_ssim_loss =  cfg.train.lamada_ssim_loss
-                        rendering_loss = lamada_image_loss * image_loss + lamada_mask_loss * mask_loss + lamada_ssim_loss * (1 - ssim_loss) 
+
+                    # decode the pcds to get a gaussian splatting pcds, and render the predicted_image
+                    new_pcds, gaussian_params_list = gaussian_regressor(data, pcds, pcds_project_to_image, feature_map, image_color) 
+                    # update pcds
+                    pcds = [p.detach().clone() for p in new_pcds]
+                    del new_pcds, pcds_project_to_image 
+                    # pcds_project_to_image = get_image_projected_points(data=data, pcds=pcds, cfg=cfg)
+
+                    image_predict = gaussian_render.rendering(data, gaussian_params_list)
+                    lamada_image_loss = cfg.train.lamada_image_loss
+                    lamada_mask_loss = cfg.train.lamada_mask_loss
+                    lamada_ssim_loss =  cfg.train.lamada_ssim_loss
+                    lamada_skeleton_loss = cfg.train.lamada_skeleton_loss
+                    if step >= 150:
+                        lamada_image_loss = cfg.train.lamada_image_loss / 2
+                        lamada_mask_loss = cfg.train.lamada_mask_loss * 2
+                        lamada_ssim_loss = cfg.train.lamada_ssim_loss * 2
+                        lamada_skeleton_loss = cfg.train.lamada_skeleton_loss * 3
                         
-                        # update the gaussian_regressor
-                        optimizer_gaussian_regressor.zero_grad()
-                        rendering_loss.backward()
-                        optimizer_gaussian_regressor.step()
-                        
-                        # update pcds
-                        pcds = [p.detach().clone() for p in new_pcds]
-                        del new_pcds, pcds_project_to_image 
-                        pcds_project_to_image = get_image_projected_points(data=data, pcds=pcds, cfg=cfg)
-                        
-                        print("inner_loop_rendering_loss:", rendering_loss)
-                        
-                        
-                        torch.cuda.empty_cache()
-                        
+                    # calculate rendering_loss
+                    image_groundtruth = image_groundtruth.to(device=image_predict.device)
+                    image_groundtruth_mask = image_groundtruth_mask.to(device=image_predict.device)
+                    image_loss = l1_loss(image_predict, image_groundtruth)
+                    mask_loss = l1_loss_mask(image_predict, image_groundtruth, image_groundtruth_mask)
+                    ssim_loss = pytorch_msssim.ssim(image_predict, image_groundtruth, data_range=1)
+                    rendering_loss = lamada_image_loss * image_loss + lamada_mask_loss * mask_loss + lamada_ssim_loss * (1 - ssim_loss) 
+
+                    # calculate gmm_loss
                     gmm_consistency_loss = 0
                     for t in range(len(pcds)):
                         _pcds = pcds[t]
                         _skeleton_gmm = skeleton_gmm[t]
                         gmm_consistency_loss += gmm_loss(points=_pcds, means=_skeleton_gmm['means'], covariances=_skeleton_gmm['cov'],  weights=_skeleton_gmm['weight'])
-
-                    lamada_skeleton_loss = cfg.train.lamada_skeleton_loss
                     skeleton_consistency_loss = lamada_skeleton_loss * gmm_consistency_loss
                     
-                    optimizer_gaussian_splatter.zero_grad()
-                    skeleton_consistency_loss.backward()
-                    optimizer_gaussian_splatter.step()
+                    # calculate loss
+                    loss = rendering_loss + skeleton_consistency_loss
+
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                    
                     step += 1
                     cprint(f"step:{step} | image_loss:{image_loss}*{lamada_image_loss} | mask_loss:{mask_loss}*{lamada_mask_loss} | ssim_loss:{1-ssim_loss}*{lamada_ssim_loss} | gmm_loss:{gmm_consistency_loss}*{lamada_skeleton_loss}", 'green')
                     save_multiview_image(image_predict, "predict")
-
+                    print(image_predict.grad)
                     # 清理不再需要的变量，释放显存
                     del means_3d, cov_3d, weight_3d, object_index, feature_map, pcds, pcds_project_to_image, skeleton_gmm, image_predict, gaussian_params_list
                     torch.cuda.empty_cache()

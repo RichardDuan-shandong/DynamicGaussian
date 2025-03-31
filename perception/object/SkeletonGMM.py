@@ -35,7 +35,6 @@ class SkeletonGMM():
         # 提取 sigma_x 和 sigma_y，并进行缩放
         sigma_x = torch.maximum(self.covariances[:, 0, 0] * sigma_scale[:, 0], torch.tensor(1e-6, device=self.covariances.device))
         sigma_y = torch.maximum(self.covariances[:, 1, 1] * sigma_scale[:, 1], torch.tensor(1e-6, device=self.covariances.device))
-
         # 计算非对角线项
         scale_xy = torch.sqrt(sigma_scale[:, 0] * sigma_scale[:, 1])
         cov_xy = torch.maximum(self.covariances[:, 0, 1] * scale_xy, torch.tensor(1e-6, device=self.covariances.device))  # 保证cov_xy合理
@@ -56,7 +55,10 @@ class SkeletonGMM():
         # 强制正定性，避免奇异矩阵
         epsilon = 1e-6  # 小正数
         cov_3D += torch.eye(3, device=cov_3D.device) * epsilon
-
+        
+        # from 2d to 3d, scale transform : sigma' = (D/f * sigma * D/f)
+        cov_3D = 1.5 * 1.5 * cov_3D / (self.cfg.cam.focal * self.cfg.cam.focal)  # in fact the 1.5 should correspond to depth, but since we have scale, it's ok to give any float between [0,1] 
+        
         return cov_3D
 
     
@@ -73,23 +75,21 @@ class SkeletonGMM():
             pos (torch.Tensor): 形状 (N, 3) 的世界坐标点。
     """
     # filtered_rays:(N, 3) depth_network_single_view:(N, 1) offset:(N,3) extr: a single np of cam pose  
-    def pos_expand_to_3D(self, filtered_rays, depth_network_single_view, offset):
-        
+    def pos_expand_to_3D(self, filtered_rays, depth, offset):
+    
         # 计算相机坐标系下的点坐标
-        # 变为正
-        depth = self.cfg.cam.znear + self.depth_act(depth_network_single_view) * (self.cfg.cam.zfar - self.cfg.cam.znear)   # (N, 1)
         # radius
-        pos = filtered_rays * depth + offset # (N, 3)
+        pos = filtered_rays * depth + offset # (N, 3)   # filtered_rays是相机坐标系下的
         # 转换为齐次坐标 (N, 4)，第四维补 1
         ones = torch.ones((pos.shape[0], 1), dtype=pos.dtype, device=pos.device)  # (N, 1)
         pos_homogeneous = torch.cat([pos, ones], dim=-1)  # (N, 4)
 
         # c2w
-        R = np.array(self.extr[:3, :3].to('cpu'), np.float32).T  # (3, 3) 变换矩阵
-        T = np.array(self.extr[:3, 3].to('cpu'), np.float32)  # (3,) 平移向量
+        R = np.array(self.extr[:3, :3].cpu(), np.float32) # (3, 3) 变换矩阵
+        T = np.array(self.extr[:3, 3].cpu(), np.float32)  # (3,) 平移向量
         c2w_matrix = getView2World(R, T)  # 获取 c2w 变换矩阵
         # 转换 `extr` 到 tensor
-        c2w_matrix = torch.tensor(c2w_matrix, dtype=torch.float32, device=pos.device)  # (4, 4)
+        c2w_matrix = torch.tensor(self.extr, dtype=torch.float32, device=pos.device)  # (4, 4)
         # 变换到世界坐标 (N, 4)
         pos_world_homogeneous = pos_homogeneous @ c2w_matrix.T  # (N, 4)
 
@@ -98,10 +98,9 @@ class SkeletonGMM():
 
         pos_world = pos_world.unsqueeze(0)
         # 转换到 canonical 空间
-        # pos_canonical = world_to_canonical(pos_world)  # (N, 3)
+        #pos_canonical = world_to_canonical(pos_world)  # (N, 3)
 
-        return pos_world    # (N, 3)
-
+        return pos_world     # (N, 3)
 
 
     """
@@ -136,7 +135,7 @@ class SkeletonGMM():
             new_weight[obj_mask] = torch.softmax(scaled_weight[obj_mask], dim=0)  # 归一化
 
         return new_weight
-    
+        #return self.weights
     
     def image_spalt(self, filtered_rays, depth, offset, sigma_scale, pi_scale, object_index):
         
@@ -146,7 +145,7 @@ class SkeletonGMM():
         
         return self.means, self.covariances, self.weights
 
-    def flip_y_axis(self, points_2d):
+    def flip_axis(self, points_2d):
         """
         对 2D 点的 y 坐标进行翻转，使其关于图像的水平中轴线对称。
         
@@ -157,76 +156,69 @@ class SkeletonGMM():
         返回:
         - 转换后的 (B, N, 2) Tensor
         """
+
         H = self.cfg.rlbench.camera_resolution[0]-1 # 获取图像高度 H
+        W = self.cfg.rlbench.camera_resolution[0]-1 # 获取图像宽度 W
         flipped_points = points_2d.clone()
+        flipped_points[..., 0] = W - points_2d[..., 0]  # x' = W - x
         flipped_points[..., 1] = H - points_2d[..., 1]  # y' = H - y
         return flipped_points
 
-
-    def project_points(self, _points_3d):
-        
+    def project_points(self, points_3d):
         """
-        将 3D 点投影到 2D 图像平面（无 batch 维度）。
+        将 3D 世界坐标点投影到 2D 图像平面。
 
         参数:
-        - points_3d: (N, 3) 的 Tensor，表示 N 个 3D 点
-        - extr_np: (4, 4) 的 NumPy 数组，表示外参矩阵
-        - intr_np: (3, 3) 的 NumPy 数组，表示内参矩阵
-        - img_size: (H, W) 图像尺寸
+        - points_3d: (N, 3) 的 Tensor，表示 N 个 3D 世界坐标点
 
         返回:
         - (N, 2) 的 Tensor，存储投影后的 2D 像素坐标
         """
-        
         img_size=(self.cfg.rlbench.camera_resolution[0], self.cfg.rlbench.camera_resolution[0])
-        
-        points_3d = _points_3d.squeeze(0)
         N, _ = points_3d.shape
 
         # **1. NumPy 转 PyTorch**
+        extr = torch.tensor(self.extr, dtype=torch.float32, device=points_3d.device)  # (4, 4)
         intr = torch.tensor(self.intr, dtype=torch.float32, device=points_3d.device)  # (3, 3)
 
-        # **2. 扩展点为齐次坐标**
-        ones = torch.ones((N, 1), device=points_3d.device)  # (N, 1)
-        points_homo = torch.cat([points_3d, ones], dim=-1)  # (N, 4)
+        # **2. 提取旋转矩阵 R 和位移向量 T**
+        R = extr[:3, :3]  # (3, 3)
+        T = extr[:3, 3]  # (3,)
 
-        # **3. 世界坐标 -> 相机坐标**
-        R = np.array(self.extr[:3, :3], np.float32).T  # (3, 3) 变换矩阵
-        T = np.array(self.extr[:3, 3], np.float32)  # (3,) 平移向量
-        w2c = getWorld2View2(R, T)
-        
-        w2c= torch.tensor(w2c, dtype=torch.float32, device=points_homo.device)  
-        points_camera_homo = points_homo @ w2c.T  # (N, 4)
-        points_camera = points_camera_homo[..., :3]  # (N, 3)
+        # **3. 计算 R 的逆**
+        R_inv = torch.linalg.inv(R)  # (3, 3)
 
-        # **4. 透视投影**
+        # **4. 世界坐标 -> 相机坐标**
+        points_camera = R_inv @ (points_3d - T).T  # (3, N)
+        points_camera = points_camera.T  # (N, 3)
+
+        # **5. 透视投影**
         X_c, Y_c, Z_c = points_camera[:, 0], points_camera[:, 1], points_camera[:, 2]
-        valid_mask = Z_c > 0  # 只投影在相机前面的点
+        valid_mask = Z_c > 0  # 只投影相机前面的点
         Z_c = torch.clamp(Z_c, min=1e-6)  # 避免除 0
         x_n = X_c / Z_c
         y_n = Y_c / Z_c
 
-        # **5. 应用相机内参**
+        # **6. 应用相机内参**
         fx, fy = abs(intr[0, 0]), abs(intr[1, 1])
         cx, cy = intr[0, 2], intr[1, 2]
         u = fx * x_n + cx
         v = fy * y_n + cy
 
-        # **6. 限制范围**
+        # **7. 限制范围**
         H, W = img_size
         u = torch.clamp(u, 0, W - 1)
         v = torch.clamp(v, 0, H - 1)
 
-        # 标记无效点
+        # **8. 标记无效点**
         u[~valid_mask] = -1
         v[~valid_mask] = -1
 
-        points_2d_projection = self.flip_y_axis(torch.stack([u, v], dim=-1))
-        
-        return points_2d_projection # (N, 2)
+        return torch.stack([u, v], dim=-1)  # (N, 2)
+    
     
     # means_3d:(N, 3) cov_3d:(N, 3, 3) weight_3d：(N, 1) object_index:(N,)
-    def gmm_sample(self, num_samples=500):
+    def gmm_sample(self, num_samples_list):
         """
         从多个 GMM（高斯混合分布）中进行采样，生成点云。
         
@@ -253,31 +245,38 @@ class SkeletonGMM():
         
         unique_objects = torch.unique(object_index_mask)  # 获取所有独立的 object_id
         sampled_points = []
-
+        
         for obj_id in unique_objects:
+            if obj_id == 0:     # mask and non_mask part have different sample nums
+                num_samples = num_samples_list[1]
+            else:
+                num_samples = num_samples_list[0]
+                
             obj_mask = object_index_mask == obj_id
-            obj_means = means_mask[obj_mask]
-            obj_covs = cov_mask[obj_mask]
+            obj_means = means_mask[obj_mask]  # (N_obj, 3)
+            obj_covs = cov_mask[obj_mask]  # (N_obj, 3, 3)
             obj_weights = weight_mask[obj_mask].squeeze(-1)  # (N_obj,)
 
-            # 归一化权重，确保 sum=1
-            obj_weights /= obj_weights.sum()
+            # 归一化权重，防止除零
+            obj_weights /= obj_weights.sum() + 1e-6  
 
-            # 根据权重进行类别采样
-            num_obj_samples = int(num_samples * obj_weights.sum().item())  # 按比重分配样本数
-            indices = torch.multinomial(obj_weights, num_obj_samples, replacement=True)  # 选高斯分布索引
-            
-            # 生成高斯分布采样点
-            selected_means = obj_means[indices].float()
-            selected_covs = obj_covs[indices].float()
+            # 按权重采样 num_samples 个 GMM 组件索引
+            indices = torch.multinomial(obj_weights, num_samples, replacement=True)  # (num_samples,)
 
-            # 采样 (num_obj_samples, 3)
+            # 获取被选中的均值和协方差
+            selected_means = obj_means[indices].float()  # (num_samples, 3)
+            selected_covs = obj_covs[indices].float()  # (num_samples, 3, 3)
+
+            # 确保协方差矩阵正定
+            selected_covs += torch.eye(3, device=selected_covs.device) * 1e-6  
+
+            # 从 GMM 采样点 (num_samples, 3)
             sampled_points_obj = torch.distributions.MultivariateNormal(selected_means, selected_covs).sample()
 
             sampled_points.append(sampled_points_obj)
 
         # 合并所有 object 采样点
-        pcd = torch.cat(sampled_points, dim=0)  # (num_samples, 3)
+        pcd = torch.cat(sampled_points, dim=0)  # (num_samples * len(unique_objects), 3)
 
         return pcd, skeleton_gmm
     

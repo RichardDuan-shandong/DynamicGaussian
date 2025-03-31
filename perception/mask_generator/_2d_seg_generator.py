@@ -29,12 +29,14 @@ import html
 import pycocotools.mask as coco_mask
 from perception.const import SAM2_CHECKPOINT, MODEL_CFG, CLIP_PATH, DINO_PY_PATH, DINO_WEIGHT_PATH, BOX_TRESHOLD, TEXT_TRESHOLD, SPACY_WEIGHT_PATH
 import torchvision.transforms as T
+import hydra
 
 class _2d_seg_generator:
     
     def __init__(self, cfg):
         self.cfg = cfg
         device = torch.device("cuda")
+        hydra.initialize()
         self.sam2 = build_sam2(MODEL_CFG, SAM2_CHECKPOINT, device=device, apply_postprocessing=False)
         
         print("start loading sam2...")

@@ -221,7 +221,7 @@ def get_keypoint_on_non_masks(images_masks, n=12, epsilon_std=0.5):
         # 5. 生成高斯混合模型参数
         means = torch.tensor(disturbed_points, dtype=torch.float32)
         means = means.clamp(min=0, max=H-1)  # 确保在图像范围内
-        covariances = torch.eye(2, dtype=torch.float32).repeat(n, 1, 1) # (n, 2, 2)
+        covariances = torch.eye(2, dtype=torch.float32).repeat(n, 1, 1) * 10  # (n, 2, 2)
         pi = torch.full((n, 1), 1.0 / n, dtype=torch.float32)  # (n, 1)
         object_index = torch.zeros((n,), dtype=torch.int32)  # 物体索引，表示为 0
 

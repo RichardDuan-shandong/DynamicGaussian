@@ -214,7 +214,6 @@ class SongUNet(nn.Module):
             film_camera_emb = silu(self.map_layer0(film_camera_emb))
             film_camera_emb = silu(self.map_layer1(film_camera_emb))
             emb = film_camera_emb
-
         # Encoder.
         skips = []
         aux = x
@@ -229,7 +228,6 @@ class SongUNet(nn.Module):
                 x = block(x, emb=emb, N_views_xa=N_views_xa) if isinstance(block, UNetBlock) \
                     else block(x, N_views_xa=N_views_xa)
                 skips.append(x)
-
         # Decoder.
         aux = None
         tmp = None

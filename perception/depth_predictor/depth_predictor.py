@@ -16,11 +16,10 @@
 import torch
 import torch.nn as nn
 import torchvision
-
+import torch.distributed as dist
 import numpy as np
 import torch
 from torch.nn.functional import silu
-from torch.amp import autocast
 from einops import rearrange, repeat
 from perception.depth_predictor.unet_part_utils import Linear, Conv2d, PositionalEmbedding
 from perception.depth_predictor.SongUnet import SongUNet
@@ -28,6 +27,7 @@ from perception.utils import fov2focal, focal2fov, world_to_canonical, canonical
 from sklearn.mixture import GaussianMixture
 from perception.depth_predictor.keypoint_sample_utils import get_keypoint
 from perception.object.SkeletonGMM import SkeletonGMM
+from torch.nn.parallel import DistributedDataParallel as DDP
 # 使用Unet进行全图每个像素的Embedding
 class UnetEmbedding(nn.Module):
     def __init__(self, cfg):
@@ -93,6 +93,7 @@ class EmbeddingDecoder(nn.Module):
             start_channels += out_channel
 
     def forward(self, x):
+        
         x = self.conv1(x)
         x = self.relu1(x)
 
@@ -108,20 +109,18 @@ class EmbeddingDecoder(nn.Module):
 
 class SkeletonRecon(nn.Module):
     def __init__(self,
-                 cfg,
-                 device_ids):
+                 cfg):
         super().__init__()
 
         self.cfg = cfg
-        self.device_ids = device_ids
         self.init_ray_dirs()
         split_dimensions, scale_inits, bias_inits = self.get_splits_and_inits(cfg)
         self.d_out = sum(split_dimensions)
         
         # self.unet_embed = UnetEmbedding(cfg, cfg.skeleton_recon.unet_embed_dim)
 
-        self.encoder = torch.nn.DataParallel(UnetEmbedding(cfg), device_ids=device_ids)
-        self.decoder = torch.nn.DataParallel(EmbeddingDecoder(cfg, split_dimensions, scale_inits, bias_inits), device_ids=device_ids)
+        self.encoder = UnetEmbedding(cfg)
+        self.decoder = EmbeddingDecoder(cfg, split_dimensions, scale_inits, bias_inits)
 
     # 生成光线向量[dx, dy, 1] ->  [dx, dy, 1] / focal 从图片坐标系转换到相机坐标系
     '''
@@ -130,10 +129,10 @@ class SkeletonRecon(nn.Module):
         ray_dirs[0, 2, :, :] → 全是 1，表示 z 方向
     '''
     def init_ray_dirs(self):
-        x = torch.linspace(-self.cfg.rlbench.camera_resolution[0] // 2 + 0.5, 
-                            self.cfg.rlbench.camera_resolution[0] // 2 - 0.5, 
+        x = torch.linspace(self.cfg.rlbench.camera_resolution[0] // 2 - 0.5, 
+                            -self.cfg.rlbench.camera_resolution[0] // 2 + 0.5, 
                             self.cfg.rlbench.camera_resolution[0]) 
-        y = torch.linspace( self.cfg.rlbench.camera_resolution[0] // 2 - 0.5, 
+        y = torch.linspace(self.cfg.rlbench.camera_resolution[0] // 2 - 0.5, 
                         -self.cfg.rlbench.camera_resolution[0] // 2 + 0.5, 
                             self.cfg.rlbench.camera_resolution[0])
 
@@ -181,14 +180,14 @@ class SkeletonRecon(nn.Module):
         scale_inits = []
         bias_inits = []
 
-        split_dimensions = split_dimensions + [1, 3, 2, 1]    # depth, offset_x/y/z, sigma_scale, pi_scale
+        split_dimensions = split_dimensions + [3, 2, 1]    # depth, offset_x/y/z, sigma_scale, pi_scale
         scale_inits = scale_inits + [
-                        cfg.skeleton_recon.depth_scale, 
+                       # cfg.skeleton_recon.depth_scale, 
                         cfg.skeleton_recon.xyz_scale, 
                         cfg.skeleton_recon.cov_scale,
                         cfg.skeleton_recon.pi_scale
                         ]
-        bias_inits = [cfg.skeleton_recon.depth_bias,
+        bias_inits = [#cfg.skeleton_recon.depth_bias,
                         cfg.skeleton_recon.xyz_bias, 
                         cfg.skeleton_recon.cov_bias,
                         cfg.skeleton_recon.pi_bias]
@@ -205,9 +204,7 @@ class SkeletonRecon(nn.Module):
 
         def sample_from_map(tensor):
             """从 (B, C, H, W) 采样，返回 (B, N, C)"""
-            B, C, H, W = tensor.shape  # 获取输入张量的形状
-            
-            # 展平 H, W 维度，变成 (B, C, H*W)
+            B, C, H, W = tensor.shape  # 获取输入张量的形状coords_to_bounding_voxel_grid
             tensor_flat = tensor.view(B, C, -1)  # (B, C, 128*128)
 
             # 计算扁平化索引
@@ -239,6 +236,12 @@ class SkeletonRecon(nn.Module):
         images_input = torch.cat(images_list, dim=0) # (B, 3, H, W)
         images_input = images_input.float() / 255.0
 
+        depths_list = [x[i]['input_view']['depth'] for i in range(len(x))]
+        depths_list = [torch.tensor(depth).unsqueeze(0).unsqueeze(0) for depth in depths_list]
+        depth = torch.cat(depths_list, dim=0) # (B, 1, H, W)
+        depth = depth.to(torch.float32)
+
+        
         # 1.sample keypoint with segemnt masks
         images_masks = []
         for i in range(len(x)):
@@ -246,7 +249,6 @@ class SkeletonRecon(nn.Module):
         # means:(B, N, 2) cov:(B, N, 2, 2) pi:(B, N, 1) object_index:(B, N) 
         # Note:N is obtained with padding, 'object_index' flags the padding part
         means, cov, pi, object_index = get_keypoint(images_masks, self.cfg, images_list=images_list)    # means在左上角坐标系（左手系）
-        
         # 2.ray init
         # filtered_rays在相机坐标系(中心原点，右手系), 输入的means要变换为左下角坐标系（右手系）
         filtered_rays = self.filter_ray(means) # on cuda:0
@@ -254,20 +256,21 @@ class SkeletonRecon(nn.Module):
         # embedding every pixel
         # （B, 64, H, W)
         # with ddp, image_input:cpu image_output:gpu
-        feature_map = self.encoder(images_input)      # feature_map左上角坐标系
         
+        images_input = images_input.to(dist.get_rank())
+        feature_map = self.encoder(images_input)      # feature_map左上角坐标系
+
         # *cpu tensor to gpu tensor
         means, cov, pi, object_index = means.to(device=feature_map.device), cov.to(device=feature_map.device), pi.to(device=feature_map.device), object_index.to(device=feature_map.device)
-        
+
         # spliter
-        #  （B, 7, H, W） 7 = 1 + 3 + 2 + 1 (1是depth, 3是x/y/z_offset, 2是sigma_x/y_scale, 1是pi_scale)
+        #  （B, 6, H, W） 6 = 3 + 2 + 1 (3是x/y/z_offset, 2是sigma_x/y_scale, 1是pi_scale)
         split_network_outputs = self.decoder(feature_map)
         split_network_outputs = split_network_outputs.split(self.spit_dimensions_output, dim = 1)   # 在 split_network_outputs上进行分割
          # depth:(B,1,128,128), offset:(B,3,128,128) sigma_scale:(B,2,128,128) pi_scale:(B,1,128,128)
-        depth, offset, sigma_scale, pi_scale = split_network_outputs[:4] # 左上角坐标系
+        offset, sigma_scale, pi_scale = split_network_outputs[:3] # 左上角坐标系
         # depth:(B,N,1), offset:(B,N,3) sigma_scale:(B,N,2) pi_scale:(B,N,1)  
         depth, offset, sigma_scale, pi_scale = self.reshape_out(means, depth, offset, sigma_scale, pi_scale) 
-        
         sigma_scale = torch.sigmoid(sigma_scale) * 2  # (B, N, 2)
         pi_scale = torch.sigmoid(pi_scale) * 2  # (B, N, 1)
         
@@ -301,7 +304,7 @@ class SkeletonRecon(nn.Module):
                                             pi_scale=pi_scale_single_view,
                                             object_index=object_index_single_view,
                                         )
-            # _2d_project_single_view = skeleton_gmm.project_points(means_3d_single_view)
+            # _2d_project_single_view = skeleton_gmm.flip_axis(skeleton_gmm.project_points(means_3d_single_view.squeeze(0)))
             
             # print(f'origin:{means[i]}')
             # print(f'projected:{_2d_project_single_view}')
@@ -319,4 +322,4 @@ class SkeletonRecon(nn.Module):
             cov_3d = torch.empty((0, 3, 3))
             weight_3d = torch.empty((0, 1))
         # (B, N, 2), (B, N, 2, 2), (B, N, 1), (B, N, 3), (B, N, 3, 3), (B, N, 1), (B, N), (B, 64, H, W)
-        return means, cov, pi, means_3d, cov_3d, weight_3d, object_index, feature_map
+        return means, cov, pi, means_3d, cov_3d, weight_3d, object_index, feature_map, images_input

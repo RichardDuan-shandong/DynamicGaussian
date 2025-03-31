@@ -32,25 +32,24 @@ def set_random_seed(seed: int):
     torch.backends.cudnn.deterministic = True  # 强制cuDNN使用确定性算法
     torch.backends.cudnn.benchmark = False  # 禁用 cuDNN 的优化
 
-def run_seed(task_index, cfg, seed, device_list):
+def run_seed(i, task_index, cfg, seed):
 
     # set conf
     set_random_seed(seed)
-    cams = cfg.rlbench.cameras  # just use [front](maybe in the proceeding work we could try multiview-fusion method, but in GaussianSkeleton we just use a single front view)
-    # rank = i
+    rank = i
     # if fabric is not None:
     #     rank = fabric.global_rank
     # else:
-    #     dist.init_process_group("gloo",
-    #                     rank=rank,
-    #                     world_size=cfg.ddp.num_devices)
+    dist.init_process_group("gloo",
+                rank=rank,
+                world_size=cfg.ddp.num_devices)
         
     # build up save_dirs
     check_and_make(cfg.train.seg_save)  # data/data_temp
     
     data_origin = _load_data(cfg)
     
-    train(data_origin, cfg, device_list)
+    train(data_origin, cfg, rank)
     
     # 一个task的场景的训练完成
     task_index.value += 1            
