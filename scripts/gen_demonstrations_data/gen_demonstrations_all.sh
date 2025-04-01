@@ -9,5 +9,5 @@ tasks=($ALL_TASK)
 
 for task in "${tasks[@]}"; do
     echo "###Generating demonstrations for task: $task"
-    bash scripts/gen_demonstrations.sh "$task"
+    bash scripts/gen_demonstrations_data/gen_demonstrations.sh "$task"
 done

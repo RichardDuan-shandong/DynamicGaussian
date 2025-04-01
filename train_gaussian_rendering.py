@@ -57,9 +57,25 @@ def main(cfg: DictConfig) -> None:
     
     world_size = cfg.ddp.num_devices
 
-    device_list = [i for i in range(world_size)]
+    #device_list = [i for i in range(world_size)]
     # use pytorch DDP
-    run_seed(task_index, cfg, start_seed, device_list)
-
+    #run_seed(task_index, cfg, start_seed, device_list)
+    import torch.multiprocessing as mp
+    mp.set_sharing_strategy('file_system')
+    from torch.multiprocessing import set_start_method, get_start_method
+    
+    try:
+        if get_start_method() != 'spawn':
+            set_start_method('spawn', force=True)
+    except RuntimeError:
+        print("Could not set start method to spawn")
+        pass
+    mp.spawn(run_seed,
+                args=(0,
+                    cfg,
+                    start_seed,
+                    ),
+                nprocs=world_size,
+                join=True)
 if __name__ == "__main__":
     main()

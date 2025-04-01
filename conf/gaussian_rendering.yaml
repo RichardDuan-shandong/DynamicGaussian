@@ -30,13 +30,13 @@ train:
     batch_size: 1                # demostration data is sampled from vedio, so in a same batch we could get a serial of data actions of tiny virations
     image_choose: [2, 7, 12, 16, 20]
     seg_save: /my/demo/seg_save  # will be removed by "${cur_dir}/data/seg_data" in cli
-    lamada_image_loss: 0.1
-    lamada_mask_loss: 0.4
-    lamada_ssim_loss: 0.15
-    lamada_skeleton_loss: 0.005
-    epochs: 5
-    lr: 0.00005
-    inner_loop_epochs: 1
+    lamada_image_loss: 0.33
+    lamada_mask_loss: 0.33
+    lamada_ssim_loss: 0.33
+    lamada_skeleton_loss: 0.01
+    epochs: 1
+    lr: 0.0001
+    inner_loop_epochs: 5
 
 skeleton_recon:
     # unet_embed
@@ -48,8 +48,8 @@ skeleton_recon:
     depth_pred_inchannels: 64
     depth_pred_midchannels: 16
     # keypoint sample
-    each_mask_sample_num: 18
-    non_masks_sample_num: 24
+    each_mask_sample_num: 24
+    non_masks_sample_num: 360
     non_masks_disturb_epsilon: 2
     # nn init scale/bias
     depth_scale: 1.0
@@ -61,7 +61,7 @@ skeleton_recon:
     pi_scale:    1.0
     pi_bias:     0.0
     # recon sample points num
-    recon_sample_num: 1000
+    recon_sample_num: [150, 3200]
 
 gaussian_renderer:
     # voxelizer
@@ -94,8 +94,8 @@ code:
 
 cam:
     focal: -110.851248
-    znear: 0.9
-    zfar: 2.7
+    znear: 1e-2
+    zfar: 10
 
 # dataset
 dataset:
